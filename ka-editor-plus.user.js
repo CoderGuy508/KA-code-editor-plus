@@ -35,6 +35,7 @@
     "\"": "\"",
     "'": "'"
   };
+  const GHOST_SYMBOL_CHARS = "+-=*!@#$%^&_;";
   const PAIRS = {
     "\"": "\"",
     "'": "'",
@@ -148,7 +149,7 @@
   let queued = false;
   let jumpStack = [];
   const ghostHighlightMarkersByEditor = new WeakMap();
-  const ghostHoverTargetByEditor = new WeakMap();
+  const autoPairEntriesByEditor = new WeakMap();
 
   function ensureStyle() {
     let style = document.getElementById(STYLE_ID);
@@ -290,13 +291,13 @@
         border-radius: 4px;
         background: repeating-linear-gradient(
           135deg,
-          rgba(255, 209, 102, 0.34) 0 6px,
-          rgba(255, 122, 89, 0.28) 6px 12px
+          rgba(150, 176, 205, 0.28) 0 6px,
+          rgba(100, 128, 156, 0.24) 6px 12px
         ) !important;
         box-shadow:
-          inset 0 0 0 1px rgba(255, 241, 118, 0.72),
-          0 0 0 1px rgba(255, 122, 89, 0.32),
-          0 0 12px rgba(255, 209, 102, 0.18);
+          inset 0 0 0 1px rgba(185, 210, 236, 0.58),
+          0 0 0 1px rgba(107, 142, 176, 0.3),
+          0 0 12px rgba(114, 150, 186, 0.16);
       }
 
       #${TOOLTIP_ID} {
@@ -610,12 +611,14 @@
   function getSymbolTargetAtPosition(editor, position, preferLeft = false) {
     const line = editor.session.getLine(position.row) || "";
     let column = position.column;
-    if (!ENCLOSURE_PAIRS[line[column]] && !CLOSING_ENCLOSURES[line[column]] && preferLeft && column > 0) {
+    let symbol = line[column] || "";
+
+    if (!GHOST_SYMBOL_CHARS.includes(symbol) && preferLeft && column > 0) {
       column -= 1;
+      symbol = line[column] || "";
     }
 
-    const symbol = line[column] || "";
-    if (!ENCLOSURE_PAIRS[symbol] && !CLOSING_ENCLOSURES[symbol]) {
+    if (!GHOST_SYMBOL_CHARS.includes(symbol)) {
       return null;
     }
 
@@ -624,24 +627,23 @@
       symbol,
       row: position.row,
       column,
-      index: positionToIndex(editor, { row: position.row, column })
+      start: { row: position.row, column },
+      end: { row: position.row, column: column + 1 },
+      startIndex: positionToIndex(editor, { row: position.row, column }),
+      endIndex: positionToIndex(editor, { row: position.row, column: column + 1 })
     };
   }
 
-  function getGhostTargetAtPosition(editor, position, preferLeft = false) {
-    return getWordTargetAtPosition(editor, position, preferLeft)
-      || getSymbolTargetAtPosition(editor, position, preferLeft);
-  }
-
-  function buildLineEnclosurePairs(line) {
+  function buildDocumentEnclosurePairs(editor) {
+    const text = getDocumentText(editor);
     const stack = [];
     const pairs = [];
 
-    for (let index = 0; index < line.length; index += 1) {
-      const character = line[index];
+    for (let index = 0; index < text.length; index += 1) {
+      const character = text[index];
       const top = stack[stack.length - 1];
 
-      if ((character === "\"" || character === "'") && !isEscaped(line, index)) {
+      if ((character === "\"" || character === "'") && !isEscaped(text, index)) {
         if (top && top.symbol === character) {
           const open = stack.pop();
           pairs.push({
@@ -681,57 +683,18 @@
     return pairs;
   }
 
-  function findEnclosingPairAtPosition(editor, position) {
-    const line = editor.session.getLine(position.row) || "";
-    const pairs = buildLineEnclosurePairs(line);
+  function findEnclosingPairAtIndex(pairs, index) {
     let bestPair = null;
 
     pairs.forEach((pair) => {
-      if (pair.openIndex < position.column && position.column <= pair.closeIndex) {
+      if (pair.openIndex < index && index <= pair.closeIndex) {
         if (!bestPair || pair.closeIndex - pair.openIndex < bestPair.closeIndex - bestPair.openIndex) {
           bestPair = pair;
         }
       }
     });
 
-    return bestPair ? { row: position.row, ...bestPair } : null;
-  }
-
-  function findPairForSymbolTarget(editor, target) {
-    if (!target || target.type !== "symbol") {
-      return null;
-    }
-
-    const line = editor.session.getLine(target.row) || "";
-    const pairs = buildLineEnclosurePairs(line);
-    return pairs.find((pair) => pair.openIndex === target.column || pair.closeIndex === target.column) || null;
-  }
-
-  function getGhostTargetSignature(target) {
-    if (!target) {
-      return "";
-    }
-
-    if (target.type === "word") {
-      return `word:${target.symbol}:${target.startIndex}:${target.endIndex}`;
-    }
-
-    return `symbol:${target.symbol}:${target.row}:${target.column}`;
-  }
-
-  function setHoverGhostTarget(editor, target) {
-    const previousTarget = ghostHoverTargetByEditor.get(editor) || null;
-    if (getGhostTargetSignature(previousTarget) === getGhostTargetSignature(target)) {
-      return false;
-    }
-
-    if (target) {
-      ghostHoverTargetByEditor.set(editor, target);
-    } else {
-      ghostHoverTargetByEditor.delete(editor);
-    }
-
-    return true;
+    return bestPair;
   }
 
   function positionToIndex(editor, position) {
@@ -938,8 +901,87 @@
       return;
     }
 
+    function getAutoPairEntries() {
+      const existing = autoPairEntriesByEditor.get(editor);
+      if (existing) {
+        return existing;
+      }
+
+      const created = [];
+      autoPairEntriesByEditor.set(editor, created);
+      return created;
+    }
+
+    function rememberAutoPair(position, open, close) {
+      const doc = editor.session?.doc;
+      if (!doc?.createAnchor) {
+        return;
+      }
+
+      const openAnchor = doc.createAnchor(position.row, position.column);
+      const closeAnchor = doc.createAnchor(position.row, position.column + 1);
+      getAutoPairEntries().push({ open, close, openAnchor, closeAnchor });
+    }
+
+    function consumeAutoPairAtCursor(cursor) {
+      const entries = getAutoPairEntries();
+      for (let index = entries.length - 1; index >= 0; index -= 1) {
+        const entry = entries[index];
+        if (
+          entry.openAnchor.row !== cursor.row
+          || entry.closeAnchor.row !== cursor.row
+          || entry.openAnchor.column !== cursor.column - 1
+          || entry.closeAnchor.column !== cursor.column
+        ) {
+          continue;
+        }
+
+        const line = editor.session.getLine(cursor.row) || "";
+        if (line[cursor.column - 1] !== entry.open || line[cursor.column] !== entry.close) {
+          entry.openAnchor.detach?.();
+          entry.closeAnchor.detach?.();
+          entries.splice(index, 1);
+          continue;
+        }
+
+        entry.openAnchor.detach?.();
+        entry.closeAnchor.detach?.();
+        entries.splice(index, 1);
+        return entry;
+      }
+
+      return null;
+    }
+
     input.addEventListener("keydown", (event) => {
-      if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || event.key.length !== 1) {
+      if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) {
+        return;
+      }
+
+      if (event.key === "Backspace") {
+        const selection = editor.getSelectionRange();
+        if (!selection || !selection.isEmpty()) {
+          return;
+        }
+
+        const cursor = editor.getCursorPosition();
+        const line = editor.session.getLine(cursor.row) || "";
+        const pairEntry = consumeAutoPairAtCursor(cursor);
+        if (!pairEntry) {
+          return;
+        }
+
+        const RangeCtor = getRangeCtor(editor);
+        if (!RangeCtor) {
+          return;
+        }
+
+        event.preventDefault();
+        editor.session.remove(new RangeCtor(cursor.row, cursor.column - 1, cursor.row, cursor.column + 1));
+        return;
+      }
+
+      if (event.key.length !== 1) {
         return;
       }
 
@@ -960,6 +1002,7 @@
 
       const selection = editor.getSelectionRange();
       const selectedText = editor.session.getTextRange(selection);
+      const cursor = editor.getCursorPosition();
 
       event.preventDefault();
 
@@ -968,7 +1011,15 @@
         return;
       }
 
+      const line = editor.session.getLine(cursor.row) || "";
+      const nextChar = line[cursor.column] || "";
+      if (nextChar === close) {
+        editor.insert(open);
+        return;
+      }
+
       editor.insert(`${open}${close}`);
+      rememberAutoPair(cursor, open, close);
       editor.navigateLeft(1);
     });
 
@@ -1043,25 +1094,30 @@
     }
   }
 
-  function addEnclosureGhosts(editor, markerIds, seenRanges, pair, row) {
+  function addSymbolGhosts(editor, markerIds, seenRanges, target, includeCurrent) {
+    if (!target || target.type !== "symbol") {
+      return;
+    }
+
+    const text = getDocumentText(editor);
+    for (let index = 0; index < text.length; index += 1) {
+      if (text[index] !== target.symbol) {
+        continue;
+      }
+      if (!includeCurrent && index === target.startIndex) {
+        continue;
+      }
+      addGhostMarkerByIndexes(editor, markerIds, seenRanges, index, index + 1);
+    }
+  }
+
+  function addEnclosureGhosts(editor, markerIds, seenRanges, pair) {
     if (!pair) {
       return;
     }
 
-    addGhostMarker(
-      editor,
-      markerIds,
-      seenRanges,
-      { row, column: pair.openIndex },
-      { row, column: pair.openIndex + 1 }
-    );
-    addGhostMarker(
-      editor,
-      markerIds,
-      seenRanges,
-      { row, column: pair.closeIndex },
-      { row, column: pair.closeIndex + 1 }
-    );
+    addGhostMarkerByIndexes(editor, markerIds, seenRanges, pair.openIndex, pair.openIndex + 1);
+    addGhostMarkerByIndexes(editor, markerIds, seenRanges, pair.closeIndex, pair.closeIndex + 1);
   }
 
   function updateGhostHighlights(editor) {
@@ -1071,8 +1127,10 @@
     const seenRanges = new Set();
     const selection = editor.getSelectionRange();
     const cursor = editor.getCursorPosition();
-    const hoverTarget = ghostHoverTargetByEditor.get(editor) || null;
+    const cursorIndex = positionToIndex(editor, cursor);
+    const enclosurePairs = buildDocumentEnclosurePairs(editor);
     let activeWordTarget = null;
+    let activeSymbolTarget = null;
 
     if (selection && !selection.isEmpty()) {
       const selectedText = editor.getSelectedText().trim();
@@ -1088,29 +1146,15 @@
       }
     } else {
       activeWordTarget = getWordTargetAtPosition(editor, cursor, true);
+      activeSymbolTarget = getSymbolTargetAtPosition(editor, cursor, true);
     }
 
-    addWordGhosts(editor, markerIds, seenRanges, activeWordTarget, false);
-    addWordGhosts(editor, markerIds, seenRanges, hoverTarget, true);
+    addWordGhosts(editor, markerIds, seenRanges, activeWordTarget, !selection || selection.isEmpty());
+    addSymbolGhosts(editor, markerIds, seenRanges, activeSymbolTarget, true);
 
-    if (hoverTarget?.type === "symbol") {
-      const hoverPair = findPairForSymbolTarget(editor, hoverTarget);
-      if (hoverPair) {
-        addEnclosureGhosts(editor, markerIds, seenRanges, hoverPair, hoverTarget.row);
-      } else {
-        addGhostMarker(
-          editor,
-          markerIds,
-          seenRanges,
-          { row: hoverTarget.row, column: hoverTarget.column },
-          { row: hoverTarget.row, column: hoverTarget.column + 1 }
-        );
-      }
-    }
-
-    const cursorPair = findEnclosingPairAtPosition(editor, cursor);
+    const cursorPair = findEnclosingPairAtIndex(enclosurePairs, cursorIndex);
     if (cursorPair) {
-      addEnclosureGhosts(editor, markerIds, seenRanges, cursorPair, cursorPair.row);
+      addEnclosureGhosts(editor, markerIds, seenRanges, cursorPair);
     }
 
     ghostHighlightMarkersByEditor.set(editor, markerIds);
@@ -1133,22 +1177,6 @@
     editor.selection.on("changeSelection", repaint);
     editor.selection.on("changeCursor", repaint);
     editor.session.on("change", repaint);
-    host.addEventListener("mousemove", (event) => {
-      const position = editor.renderer?.screenToTextCoordinates?.(event.clientX, event.clientY);
-      if (!position) {
-        return;
-      }
-
-      const target = getGhostTargetAtPosition(editor, position, false);
-      if (setHoverGhostTarget(editor, target)) {
-        repaint();
-      }
-    });
-    host.addEventListener("mouseleave", () => {
-      if (setHoverGhostTarget(editor, null)) {
-        repaint();
-      }
-    });
     host.addEventListener("mouseup", () => {
       window.setTimeout(repaint, 0);
     });
